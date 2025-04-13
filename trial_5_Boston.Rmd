@@ -1,0 +1,895 @@
+---
+title: "Thesis Coding: Spatial GPR"
+author: "Bahian, Ken Andrea Lee"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: '4'
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 4
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+\newpage
+
+# Libraries
+
+```{r, message=FALSE, warning=FALSE}
+# Data Manipulation and Wrangling
+library(dplyr)          # Data manipulation (filter, mutate, summarize, etc.)
+library(tidyr)          # Data wrangling (pivoting, reshaping data)
+library(readr)          # Reading CSV files
+
+# Data Visualization
+library(ggplot2)        # Creating plots and maps
+library(viridis)        # Color palettes for better visualization
+library(gridExtra)      # Arranging multiple ggplots in a grid layout
+
+# Gaussian Process Regression (GPR)
+library(kernlab)        # Kernel-based methods, including GPR
+
+# Bayesian Model Averaging (BMA)
+library(BAS)            # Bayesian Adaptive Sampling for Bayesian Model Averaging (BMA)
+
+# Model Evaluation
+library(Metrics)        # Performance metrics (e.g., RMSE)
+
+# Geographically Weighted Regression (GWR)
+library(spgwr)          # GWR
+
+# Spatial Analysis
+library(sf)             # For handling spatial data
+
+# Table Formatting
+library(knitr)          # Formatting tables in reports
+```
+
+
+# Data
+```{r}
+# Load the data from the CSV file "Boston_Housing_Data_____Corrected_211_15.csv" into a data frame named 'data'
+data_boston <- read.csv("Boston_Housing_Data_____Corrected_211_15.csv")
+
+# Identify where structured data starts (row 10 in this case)
+structured_data <- data_boston[10:nrow(data_boston), "dat", drop = FALSE]
+
+# Extract column names from the first row
+column_names <- unlist(strsplit(structured_data[1,], "\t"))
+
+# Extract actual data and split it into columns
+data_values <- strsplit(structured_data[-1,], "\t")
+data_cleaned <- as.data.frame(do.call(rbind, data_values), stringsAsFactors = FALSE)
+
+# Assign column names
+colnames(data_cleaned) <- column_names
+
+# Convert Latitude and Longitude to numeric
+data_cleaned$LAT <- as.numeric(data_cleaned$LAT)
+data_cleaned$LON <- as.numeric(data_cleaned$LON)
+
+# Create separate columns for Latitude, Longitude, and Town
+data_boston <- data_cleaned %>%
+  mutate(Latitude = LAT,
+         Longitude = LON,
+         Town = TOWN)
+
+# Identify character columns to convert (excluding "TOWN" and "Town")
+numeric_cols <- setdiff(names(data_boston)[sapply(data_boston, is.character)], c("TOWN", "Town"))
+
+# Convert only selected character columns to numeric
+data_boston[numeric_cols] <- lapply(data_boston[numeric_cols], as.numeric)
+
+# Display the first few rows
+str(data_boston)
+head(data_boston, 10)
+set.seed(070330)
+```
+
+# EDA
+```{r}
+# Extract unique town names from the data frame
+unique_towns <- unique(data_boston$TOWN)
+
+# Convert to a data frame for better readability (optional)
+unique_towns_df <- data.frame(Town = unique_towns)
+
+# Print the unique town names
+head(unique_towns_df)
+
+
+## Create a summary table for numeric columns only, excluding Latitude, Longitude, and TRACT
+summary_table <- data_boston %>%
+  select(-c(Latitude, Longitude, TRACT)) %>%  # Exclude specific columns
+  select_if(is.numeric) %>%  # Select only numeric columns
+  summarise(across(everything(), list(
+    Mean = ~ mean(.x, na.rm = TRUE),
+    Median = ~ median(.x, na.rm = TRUE),
+    Min = ~ min(.x, na.rm = TRUE),
+    Max = ~ max(.x, na.rm = TRUE),
+    SD = ~ sd(.x, na.rm = TRUE)
+  ))) %>%
+  pivot_longer(everything(), names_to = c("Variable", "Statistic"), values_to = "Value", names_sep = "_") %>%
+  pivot_wider(names_from = Variable, values_from = Value)
+
+# View the summary table
+print(summary_table)
+
+# Save the summary table
+write.csv(summary_table, "summary_table.csv", row.names = FALSE)
+```
+
+# Preprocessing the Data
+```{r}
+# Recover original values
+data_boston$B <- (data_boston$B + 0.63)^2
+data_boston$MEDV <- log(data_boston$MEDV)
+data_boston$LSTAT <- log(data_boston$LSTAT)
+data_boston$DIS <- log(data_boston$DIS)
+data_boston$RAD <- log(data_boston$RAD)
+data_boston$NOX <- data_boston$NOX^2
+
+# Display first few rows of the recovered values
+head(data_boston[, c("B", "MEDV", "LSTAT", "DIS", "RAD", "NOX")])
+
+# Save the preprocessed data
+write.csv(data_boston, "preprocessed_boston_data.csv", row.names = FALSE)
+```
+
+## Standardizing the Data
+```{r}
+# Remove unnecessary columns
+data_boston <- data_boston %>%
+  select(-c(OBS., `TOWN#`, LON, LAT, Town, CMEDV))
+
+# Reorder columns: Place TOWN, Latitude, and Longitude first
+data_boston <- data_boston %>%
+  select(Latitude, Longitude, TRACT, everything())
+
+# Standardize all numeric variables except Latitude, Longitude and MEDV (Response Variable) 
+data_boston_scaled <- data_boston %>%
+  mutate(across(where(is.numeric) & !c(TRACT, MEDV), ~ scale(.)))
+
+# Standardize all numeric variables except Latitude, Longitude and MEDV (Response Variable) 
+data_boston_GWR <- data_boston %>%
+  mutate(across(where(is.numeric) & !c(Latitude, Longitude, TRACT, MEDV), ~ scale(.)))
+
+
+data_boston <- as.data.frame(lapply(data_boston_scaled, function(x) {
+  if (is.matrix(x)) as.vector(x) else x
+}))
+
+# Check structure again
+str(data_boston)
+
+# Display the first few rows to check standardization
+head(data_boston)
+
+# Save the cleaned data frame
+write.csv(data_boston, "cleaned_boston_data.csv", row.names = FALSE)
+```
+
+
+
+
+
+# GPR-BMA
+
+## Predictors
+```{r}
+# Select predictors
+additional_vars <- c("Latitude", "Longitude", "CRIM", "ZN", "INDUS", "CHAS", "NOX", "RM", "AGE", "DIS", "RAD", "TAX", "PTRATIO", "B", "LSTAT")
+
+# Generate predictor combinations for isotropic models
+predictor_combos_iso <- list()
+
+for (n in c(1, 2, 3, 4,5, 6, 7, 8, 9, 10, 11, 12, 13,14,15)) {
+  if (n <= length(additional_vars)) {  
+    comb_list <- combn(additional_vars, n, simplify = FALSE)
+    
+    if (length(comb_list) > 0) {  # Ensure combinations exist
+      for (i in seq_along(comb_list)) {
+        combo_name_iso <- paste0("iso_combo", n, "_", i)
+        predictor_combos_iso[[combo_name_iso]] <- c(comb_list[[i]])
+      }
+    }
+  }
+}
+
+# Select the last 100 predictor combinations
+#predictor_combos_iso <- tail(predictor_combos_iso, 150)
+length(predictor_combos_iso)
+tail(predictor_combos_iso, 10)
+# Save the predictor combinations to an RDS file
+saveRDS(predictor_combos_iso, "predictor_combos_iso.rds")
+```
+
+## Kernels
+```{r}
+# Isotropic Kernel Formula (Equation 2.3)
+isotropic_kernel <- function(x1, x2, v, tau) {
+  exp(-tau * sum((x1 - x2)^2)) * v
+}
+```
+
+## Gaussian Process Regression - Bayesian Model Averaging (GPR-BMA)
+### Gaussian Process Regression
+```{r}
+# Load required libraries
+library(kernlab)  # For Gaussian Process Regression
+
+# Initialize lists to store GPR models and predictor names
+gpr_models_iso <- list()
+predictor_names_iso <- list()
+
+# Loop through each predictor combination
+for (combo_name in names(predictor_combos_iso)) {
+    # Extract the predictor variables
+    predictors <- predictor_combos_iso[[combo_name]]
+    
+    # Check if all predictors are in the data
+    if (all(predictors %in% colnames(data_boston))) {
+        # Subset the data to include only the chosen predictors
+        data_subset <- data_boston[, c(predictors, "MEDV")]
+        
+        # Fit the GPR model using the squared exponential (RBF) kernel
+        gpr_model <- gausspr(MEDV ~ ., data = data_subset, kernel = "rbfdot")
+        
+        # Store the model and the predictor names in the lists
+        gpr_models_iso[[combo_name]] <- gpr_model
+        predictor_names_iso[[combo_name]] <- predictors  # Store the predictor names
+        
+        # Debugging: Print the name of the model being stored
+        print(paste("Successfully stored model for combination:", combo_name))
+    } else {
+        warning(paste("Skipping combination:", combo_name, "due to missing predictors."))
+    }
+}
+
+
+# Check the number of models stored
+print(paste("Number of GPR models stored:", length(gpr_models_iso)))
+```
+
+
+
+
+### Extracting BIC, MAP, and SPBIC
+```{r}
+# Initialize a list to store the evaluation metrics (BIC, MAP, SPBIC)
+model_metrics_iso <- list()
+
+# Function to compute log-likelihood for GPR model (used for MAP and SPBIC calculation)
+log_likelihood <- function(model, data) {
+  # Get the predictions from the GPR model
+  predictions <- predict(model, newdata = data)
+  
+  # Compute residual sum of squares (RSS)
+  residuals <- data$MEDV - predictions
+  rss <- sum(residuals^2)
+  
+  # Calculate the log-likelihood (assuming Gaussian errors)
+  n <- length(residuals)  # Number of observations
+  log_lik <- -0.5 * (n * log(rss / n) + n * log(2 * pi))  # Log-likelihood for Gaussian model
+  
+  return(log_lik)
+}
+
+# Function to compute Hessian approximation for GPR (if necessary for MAP calculation)
+compute_hessian <- function(model, data) {
+  # This part might be difficult for GPR; we use a simple approximation here
+  # For the Gaussian Process, we will assume a diagonal Hessian (simplified)
+  # In practice, the Hessian should come from the model fitting procedure (e.g., via optimization).
+  
+  # This is a placeholder approximation and may not be accurate in all cases.
+  hessian_approx <- diag(rep(1, length(coef(model))))  # Assuming diagonal Hessian
+  return(hessian_approx)
+}
+
+# Loop through each GPR model in the list
+for (combo_name in names(gpr_models_iso)) {
+  # Extract the GPR model
+  gpr_model <- gpr_models_iso[[combo_name]]
+  
+  # Compute log-likelihood
+  log_lik_value <- log_likelihood(gpr_model, data_boston)
+  
+  # Number of parameters in the model (qM)
+  qM <- length(coef(gpr_model))  # Number of parameters
+  
+  # Number of observations (n)
+  n <- nrow(data_boston)
+  
+  # Compute BIC
+  bic_value <- log_lik_value - (qM / 2) * log(n)
+  
+  # Compute MAP (requires Hessian, log-prior of parameters assumed to be uniform)
+  hessian_value <- compute_hessian(gpr_model, data_boston)
+  log_det_hessian <- log(det(hessian_value))  # log determinant of the Hessian matrix
+  map_value <- log_lik_value - 0.5 * log_det_hessian - (qM / 2) * log(2 * pi)
+  
+  # Compute SPBIC (using scaling function g(qM) - placeholder)
+  g_qM <- qM  # Placeholder for scaling function; modify if you have a specific formula
+  spbic_value <- log_lik_value - (qM / 2) * log(n) + log(g_qM)
+  
+  # Store the metrics in the list
+  model_metrics_iso[[combo_name]] <- list(
+    BIC = bic_value,
+    MAP = map_value,
+    SPBIC = spbic_value
+  )
+}
+
+# Convert the model metrics list into a data frame for easy viewing
+model_metrics_df <- do.call(rbind, lapply(model_metrics_iso, function(x) unlist(x)))
+rownames(model_metrics_df) <- names(model_metrics_iso)
+
+# Display the results
+tail(model_metrics_df, 10)
+
+# After fitting GPR models
+saveRDS(gpr_models_iso, "gpr_models_iso.rds")
+write.csv(model_metrics_df, "model_metrics.csv", row.names = TRUE)
+```
+
+```{r}
+### Applying Bayesian Model Averaging
+bma_prediction_using_BAS <- function(models, predictor_names, metrics, data) {
+    # Filter out null models
+    valid_models <- !sapply(models, is.null)
+    models <- models[valid_models]
+    predictor_names <- predictor_names[valid_models]
+    metrics <- metrics[valid_models]
+    
+    # Generate predictions for each valid model without storing individual predictions
+    predictions <- sapply(seq_along(models), function(i) {
+        model <- models[[i]]
+        predictors <- predictor_names[[i]]
+        
+        # Check if all predictors are in the data
+        missing_predictors <- setdiff(predictors, colnames(data))
+        if (length(missing_predictors) > 0) {
+            warning(paste("Predictor(s) not found in data for model:", names(models)[i], 
+                          "Missing:", paste(missing_predictors, collapse = ", ")))
+            return(rep(NA, nrow(data)))  # Return NA for predictions if predictors are missing
+        }
+        
+        # Make predictions
+        pred <- predict(model, newdata = data)
+        
+        return(pred)
+    })
+    
+    # Convert predictions into a data frame (each column represents a model's predictions)
+    pred_df <- as.data.frame(predictions)
+    colnames(pred_df) <- names(models)
+    
+    # Extract BIC, MAP, and SPBIC values
+    bic_values <- sapply(metrics, function(x) x$BIC)
+    map_values <- sapply(metrics, function(x) x$MAP)
+    spbic_values <- sapply(metrics, function(x) x$SPBIC)
+    
+    # Normalize the BIC, MAP, and SPBIC values to get model weights
+    bic_weights <- exp(-0.5 * (bic_values - min(bic_values))) / sum(exp(-0.5 * (bic_values - min(bic_values))))
+    map_weights <- exp(map_values - max(map_values)) / sum(exp(map_values - max(map_values)))
+    spbic_weights <- exp(-0.5 * (spbic_values - min(spbic_values))) / sum(exp(-0.5 * (spbic_values - min(spbic_values))))
+        
+    # Use the BAS package to perform Bayesian Model Averaging
+    bma_model <- bas.lm(MEDV ~ ., data = cbind(data, pred_df), prior = "g-prior", modelprior = uniform())
+    
+    # Predict using the BMA model
+    bma_pred <- predict(bma_model, newdata = data, type = "response")
+    
+    # Extract BIC, SPBIC, and MAP from the BMA model
+    bma_bic <- BIC(bma_model)
+    bma_spbic <- SPBIC(bma_model)
+    bma_map <- MAP(bma_model)
+    
+    # Extract variable inclusion probabilities
+    inclusion_probs <- summary(bma_model)$probabilities
+    
+    # Return the predictions and metrics without individual model predictions
+    return(list(
+        predictions = bma_pred, 
+        BIC = bma_bic, 
+        SPBIC = bma_spbic, 
+        MAP = bma_map, 
+        inclusion_probabilities = inclusion_probs
+    ))
+}
+
+# Assuming model_metrics_iso is a list of lists containing BIC, MAP, and SPBIC
+bic_values <- sapply(model_metrics_iso, function(x) x$BIC)
+map_values <- sapply(model_metrics_iso, function(x) x$MAP)
+spbic_values <- sapply(model_metrics_iso, function(x) x$SPBIC)
+
+# Normalize the BIC, MAP, and SPBIC values to get model weights
+bic_weights <- exp(-0.5 * (bic_values - min(bic_values))) / sum(exp(-0.5 * (bic_values - min(bic_values))))
+map_weights <- exp(map_values - max(map_values)) / sum(exp(map_values - max(map_values)))
+spbic_weights <- exp(-0.5 * (spbic_values - min(spbic_values))) / sum(exp(-0.5 * (spbic_values - min(spbic_values))))
+
+# Initialize a data frame to store predictions
+predictions_bic <- numeric(nrow(data_boston))
+predictions_map <- numeric(nrow(data_boston))
+predictions_spbic <- numeric(nrow(data_boston))
+
+# Loop through each model to get predictions
+for (i in seq_along(gpr_models_iso)) {
+    model <- gpr_models_iso[[i]]
+    
+    # Make predictions for the current model
+    pred <- predict(model, newdata = data_boston)
+    
+    # Weighted predictions
+    predictions_bic <- predictions_bic + bic_weights[i] * pred
+    predictions_map <- predictions_map + map_weights[i] * pred
+    predictions_spbic <- predictions_spbic + spbic_weights[i] * pred
+}
+
+# Combine predictions into a data frame
+final_predictions <- data.frame(
+    Actual = data_boston$MEDV,
+    BIC_Predicted = predictions_bic,
+    MAP_Predicted = predictions_map,
+    SPBIC_Predicted = predictions_spbic
+)
+
+head(final_predictions)
+# After calculating predictions
+write.csv(final_predictions, "final_predictions.csv", row.names = FALSE)
+```
+
+
+### Individual Model Predictions
+```{r}
+# Check individual model predictions
+individual_predictions <- list()
+for (i in seq_along(gpr_models_iso)) {
+    model <- gpr_models_iso[[i]]
+    pred <- predict(model, newdata = data_boston)
+    individual_predictions[[i]] <- pred
+    print(paste("Predictions from model", i, ":", paste(head(pred), collapse = ", ")))
+}
+
+# Save individual predictions to an RDS file
+saveRDS(individual_predictions, "individual_predictions.rds")
+```
+
+
+```{r}
+# Assuming you have the actual values and predictions
+actual_values <- data_boston$MEDV  # Actual response variable
+
+# Predictions from models based on BIC, MAP, and SPBIC
+predictions_bic <- predictions_bic  # Replace with your actual BIC predictions
+predictions_map <- predictions_map  # Replace with your actual MAP predictions
+predictions_spbic <- predictions_spbic  # Replace with your actual SPBIC predictions
+
+# Function to calculate RMSE
+calculate_rmse <- function(actual, predicted) {
+    sqrt(mean((actual - predicted)^2))
+}
+
+# Calculate RMSE for BIC, MAP, and SPBIC
+rmse_bic <- calculate_rmse(actual_values, predictions_bic)
+rmse_map <- calculate_rmse(actual_values, predictions_map)
+rmse_spbic <- calculate_rmse(actual_values, predictions_spbic)
+
+# Create a data frame for RMSE results
+rmse_results_df <- data.frame(
+    Model = c("BIC", "MAP", "SPBIC"),
+    RMSE = c(rmse_bic, rmse_map, rmse_spbic)
+)
+
+# Display the RMSE results data frame
+print(rmse_results_df)
+
+# Save the RMSE results
+write.csv(rmse_results_df, "rmse_results.csv", row.names = FALSE)
+```
+
+## Select Best Model
+```{r}
+# Select the best model based on the minimum RMSE
+best_model <- rmse_results_df[which.min(rmse_results_df$RMSE), ]
+
+# Display the best model
+print(paste("Best Model: ", best_model$Model, "with RMSE:", best_model$RMSE))
+
+# Extract the predictions for the best model
+if (best_model$Model == "BIC") {
+    best_model_predictions <- final_predictions$BIC_Predicted
+} else if (best_model$Model == "MAP") {
+    best_model_predictions <- final_predictions$MAP_Predicted
+} else if (best_model$Model == "SPBIC") {
+    best_model_predictions <- final_predictions$SPBIC_Predicted
+}
+
+# Add the best model predictions to the data_boston dataframe
+data_boston$GPR_BMA <- best_model_predictions
+
+# Display the first few rows of the updated data_boston
+head(data_boston)
+
+# Select the relevant columns
+selected_data_GPR_BMA <- data_boston %>%
+  select(Latitude, Longitude, TOWN, MEDV, GPR_BMA)
+
+# Save the selected data to a CSV file
+write.csv(selected_data_GPR_BMA, "selected_data.csv", row.names = FALSE)
+```
+
+
+# Other Model
+
+## Gaussian Process Regression (GPR)
+```{r}
+# Using Kernlab for GPR prediction
+
+# Define predictors
+selected_predictors <- c("CRIM", "ZN", "INDUS", "CHAS", "NOX", "RM", "AGE", 
+                         "DIS", "RAD", "TAX", "PTRATIO", "B", "LSTAT")
+
+# Ensure all selected predictors exist in `data_boston`
+selected_predictors <- intersect(selected_predictors, colnames(data_boston))
+
+# Prepare the data
+X_train <- data_boston[selected_predictors]  # Features
+y_train <- data_boston$MEDV                  # Use MEDV directly (without exp())
+
+# Train GPR Model using kernlab
+gpr_model_kernlab <- gausspr(
+  x = as.matrix(X_train),
+  y = y_train,
+  kernel = "rbfdot"  # Radial Basis Function (RBF) kernel
+)
+
+# Make Predictions
+predictions_gpr <- predict(gpr_model_kernlab, as.matrix(X_train))
+
+# Store predictions in the dataset
+data_boston$GPR_MEDV <- predictions_gpr
+
+# Convert predictions and y_train to exp * 1000 scale
+y_train_transformed <- exp(y_train) * 1000
+predictions_gpr_transformed <- exp(predictions_gpr) * 1000
+
+# Store transformed predictions in the dataset
+data_boston$GPR_MEDV <- predictions_gpr_transformed
+
+# Compute RMSE in the transformed scale
+rmse_gpr <- sqrt(mean((y_train - predictions_gpr)^2, na.rm = TRUE))
+print(paste("RMSE (GPR):", rmse_gpr))
+
+# Select the relevant columns
+selected_data_GPR <- data_boston %>%
+  select(Latitude, Longitude, TOWN, MEDV, GPR_MEDV)
+
+# Save the selected data to a CSV file
+write.csv(selected_data_GPR, "selected_data.csv", row.names = FALSE)
+```
+
+
+## Geographical Weighted Regression (GWR)
+
+```{r}
+# Convert data to SpatialPointsDataFrame
+coordinates(data_boston_GWR) <- ~Longitude + Latitude  
+proj4string(data_boston_GWR) <- CRS("+proj=longlat +datum=WGS84")
+```
+
+
+```{r}
+# Define the bandwidth using cross-validation
+gwr_bandwidth <- gwr.sel(
+  MEDV ~ CRIM + ZN + INDUS + CHAS + NOX + RM + AGE + DIS + 
+    RAD + TAX + PTRATIO + B + LSTAT,
+  data = data_boston_GWR,
+  adapt = TRUE
+)
+
+# Fit the GWR model
+gwr_model <- gwr(
+  MEDV ~ CRIM + ZN + INDUS + CHAS + NOX + RM + AGE + DIS + 
+    RAD + TAX + PTRATIO + B + LSTAT, 
+  data = data_boston_GWR, 
+  adapt = gwr_bandwidth, 
+  hatmatrix = TRUE
+)
+
+# Extract fitted values and residuals
+observed_values <- (exp(data_boston$MEDV))*1000
+GWR_MEDV <- gwr_model$SDF$pred
+data_boston$GWR_MEDV <- GWR_MEDV
+
+
+# Select the relevant columns
+selected_data_GWR <- data_boston %>%
+  select(Latitude, Longitude, TOWN, MEDV, GWR_MEDV)
+
+# Save the selected data to a CSV file
+write.csv(selected_data_GWR, "selected_data.csv", row.names = FALSE)
+
+GWR_MEDV_original <- gwr_model$SDF$pred
+data_boston$GWR_MEDV <- (exp(GWR_MEDV))*1000
+# Convert predicted and observed values back to original scale
+data_boston$GWR_MEDV_original <- data_boston$GWR_MEDV
+
+data_boston$GWR_Residuals <- data_boston$MEDV - GWR_MEDV_original
+
+# Compute RMSE for GWR
+rmse_gwr <- sqrt(mean(((data_boston$GWR_Residuals)^2), na.rm = FALSE))
+print(paste("RMSE (GWR):", rmse_gwr))
+```
+
+
+# Comparison Result
+
+```{r}
+# Convert Spatial Points DataFrame to a regular data frame
+data_df <- as.data.frame(data_boston) %>%
+  mutate(TOWN = as.character(TOWN))  # Ensure TOWN is a character
+
+# Create the results table
+results_table <- data_df %>%
+  select(TOWN) %>%
+  mutate(
+    Latitude = data_boston_GWR$Latitude,
+    Longitude = data_boston_GWR$Longitude,
+    MEDV = observed_values,
+    GPR_BMA = exp(data_df$GPR_BMA) * 1000,  # GPR-BMA MAP Predictions
+    GPR_Prediction = data_df$GPR_MEDV ,  # GPR Predictions from kernlab
+    GWR_Prediction = data_df$GWR_MEDV,  # GWR Predictions
+  )
+
+# Print table
+kable(results_table, digits = 3, caption = "Comparison of MEDV Predictions")
+
+# Saving the comparison results table
+write.csv(results_table, "comparison_results.csv", row.names = FALSE)
+```
+
+
+# Evaluation Metrics using RMSE
+
+```{r}
+# Summarizing RMSE values for all models
+rmse_summary <- data.frame(
+  Model = c("GPR", "GPR-BMA", "GWR"),
+  RMSE = c(rmse_gpr, best_model$RMSE, rmse_gwr)
+)
+
+# Display RMSE table with knitr for better formatting
+kable(rmse_summary, digits = 3, caption = "RMSE Comparison of Models")
+
+# Save RMSE values
+write.csv(rmse_summary, "rmse_summary.csv", row.names = FALSE)
+```
+
+# PLOT
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(gridExtra)
+library(viridis)
+
+# Convert data to sf object for spatial plotting
+data_sf <- st_as_sf(data_boston, coords = c("Longitude", "Latitude"), crs = 4326)
+
+# Ensure `data_sf` is an sf object
+if (!inherits(data_sf, "sf")) {
+  stop("Error: `data_sf` must be an sf object with geometry.")
+}
+
+# Define the color limits and breaks
+color_limits <- c(0, 50000)  # Adjust based on your data range
+color_breaks <- seq(0, 50000, by = 5000)  # Breaks every 5,000
+
+# Define the color palette from yellow to orange to red
+color_palette <- c("yellow", "orange", "red", "darkred")
+
+data_sf$MEDV <- exp(data_sf$MEDV)*1000
+data_sf$GPR_BMA <- exp(data_sf$GPR_BMA)*1000
+
+# Plot True MEDV Values
+p1 <- ggplot(data = data_sf) +
+  geom_sf(aes(color = MEDV), size = 2) +
+  scale_color_gradientn(colors = color_palette, limits = color_limits, breaks = color_breaks) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("True MEDV Values")
+
+# Plot Predicted MEDV Values (GPR-BMA)
+p2 <- ggplot(data = data_sf) +
+  geom_sf(aes(color = GPR_BMA), size = 2) +
+  scale_color_gradientn(colors = color_palette, limits = color_limits, breaks = color_breaks) +
+  theme_minimal() + 
+  theme(plot.title = element_text(hjust = 0.5, size = 14),
+        axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle(paste("Predicted MEDV (", best_model$Model, ")"))
+
+# Plot Predicted MEDV Values (GPR)
+p3 <- ggplot(data = data_sf) +
+  geom_sf(aes(color = GPR_MEDV), size = 2) +
+  scale_color_gradientn(colors = color_palette, limits = color_limits, breaks = color_breaks) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Predicted MEDV (GPR)")
+
+# Plot Predicted MEDV Values (GWR)
+p4 <- ggplot(data = data_sf) +
+  geom_sf(aes(color = GWR_MEDV_original), size = 2) +
+  scale_color_gradientn(colors = color_palette, limits = color_limits, breaks = color_breaks) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("Predicted MEDV (GWR)")
+
+# Display plots side by side
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+
+# Save the plots as JPEG files
+ggsave("true_medv_values.jpeg", plot = p1, width = 10, height = 6)
+ggsave("predicted_medv_bma.jpeg", plot = p2, width = 10, height = 6)
+ggsave("predicted_medv_gpr.jpeg", plot = p3, width = 10, height = 6)
+ggsave("predicted_medv_gwr.jpeg", plot = p4, width = 10, height = 6)
+
+# MEDV vs GPR BMA
+p_bma <- grid.arrange(p1, p2, ncol = 2, top = "Comparison: True MEDV vs Predicted MEDV (GPR-BMA)")
+ggsave("MEDV_vs_GPR_BMA.jpeg", plot = p_bma, width = 10, height = 6, units = "in", dpi = 300)
+
+# MEDV vs GPR
+p_gpr <- grid.arrange(p1, p3, ncol = 2, top = "Comparison: True MEDV vs Predicted MEDV (GPR)")
+ggsave("MEDV_vs_GPR.jpeg", plot = p_gpr, width = 10, height = 6, units = "in", dpi = 300)
+
+# MEDV vs GWR
+p_gwr <- grid.arrange(p1, p4, ncol = 2, top = "Comparison: True MEDV vs Predicted MEDV (GWR)")
+ggsave("MEDV_vs_GWR.jpeg", plot = p_gwr, width = 10, height = 6, units = "in", dpi = 300)
+```
+
+
+
+```{r}
+library(sf)
+# Load shapefile (assuming it's already extracted)
+shapefile_path <- "bos_land"
+map_data <- st_read(shapefile_path)
+
+# Check the structure and summary of the map data
+print(map_data)
+summary(map_data)
+```
+
+
+```{r}
+# Load necessary libraries
+#library(sf)             # For handling spatial data
+#library(dplyr)          # For data manipulation
+#library(ggplot2)        # For data visualization
+#library(viridis)        # For color palettes
+
+# Clean and prepare the Boston data
+#data_boston <- data_boston %>%
+#  mutate(TOWN = as.character(TOWN))  # Ensure TOWN is character type
+
+# Check for duplicates in the Boston data
+#boston_duplicates <- data_boston %>%
+#  group_by(TOWN) %>%
+#  filter(n() > 1) %>%
+#  summarise(count = n())
+
+# Print duplicates if any
+#if (nrow(boston_duplicates) > 0) {
+#  print("Duplicate towns in Boston data:")
+#  print(boston_duplicates)
+#}
+
+# Check for duplicates in the map data
+#map_duplicates <- map_data %>%
+#  group_by(name) %>%
+#  filter(n() > 1) %>%
+#  summarise(count = n())
+
+# Print duplicates if any
+#if (nrow(map_duplicates) > 0) {
+#  print("Duplicate towns in map data:")
+#  print(map_duplicates)
+#}
+
+# If duplicates exist, you may want to handle them. For example, you can keep the first occurrence:
+#data_boston_unique <- data_boston %>%
+#  distinct(TOWN, .keep_all = TRUE)
+
+#map_data_unique <- map_data %>%
+#  distinct(name, .keep_all = TRUE)
+
+# Perform a left join to match the town data with the shapefile
+#matched_data <- data_boston_unique %>%
+#  left_join(map_data_unique, by = c("TOWN" = "name"))
+
+# Check for any missing values after the join
+#unmatched_towns <- matched_data %>%
+#  filter(is.na(fclass))  # Assuming fclass is a column from map_data
+
+# Print unmatched towns
+#if (nrow(unmatched_towns) > 0) {
+#  print("Unmatched towns in Boston data:")
+#  print(unmatched_towns)
+#} else {
+#  print("All towns matched successfully.")
+#}
+
+# Ensure that the geometry column is included in the matched_data
+#matched_data <- matched_data %>%
+#  st_as_sf()  # Convert to sf object if not already
+
+#matched_data$MEDV
+
+
+#ggplot(data = matched_data) +
+#  geom_sf(aes(fill = MEDV), color = "white") +
+#  scale_fill_viridis_c(option = "plasma", na.value = "grey") +  # Handle NA values
+#  labs(title = "Choropleth Map of Median Home Values (MEDV) in Massachusetts",
+#       fill = "Median Home Value ($1000s)") +
+#  theme_minimal() +
+#  theme(legend.position = "right")
+```
+
+
+
+
+
+
+```{r}
+# Convert the model metrics list into a data frame for easy viewing
+model_metrics_df <- do.call(rbind, lapply(model_metrics_iso, function(x) unlist(x)))
+
+# Ensure row names are set correctly
+rownames(model_metrics_df) <- names(model_metrics_iso)
+
+# Convert to data frame if it's not already
+model_metrics_df <- as.data.frame(model_metrics_df)
+
+# Sort the models by BIC, MAP, and SPBIC and extract the top 10
+top_10_bic_indices <- order(model_metrics_df$BIC)[1:10]
+top_10_map_indices <- order(-model_metrics_df$MAP)[1:10]
+top_10_spbic_indices <- order(model_metrics_df$SPBIC)[1:10]
+
+# Function to display top models and their variables and save to a file
+display_top_models_with_variables <- function(indices, metric_name, file_name) {
+    # Open a connection to the file
+    sink(file_name)
+    cat(paste("Top 10 Models by", metric_name, ":\n"))
+    for (i in indices) {
+        model_name <- rownames(model_metrics_df)[i]
+        variables <- predictor_names_iso[[model_name]]
+        cat(paste("Model:", model_name, "\n"))
+        cat("Variables:", paste(variables, collapse = ", "), "\n\n")
+    }
+    # Close the connection to the file
+    sink()
+}
+
+# Display and save the top 10 models for BIC
+display_top_models_with_variables(top_10_bic_indices, "BIC", "top_10_models_bic.txt")
+
+# Display and save the top 10 models for MAP
+display_top_models_with_variables(top_10_map_indices, "MAP", "top_10_models_map.txt")
+
+# Display and save the top 10 models for SPBIC
+display_top_models_with_variables(top_10_spbic_indices, "SPBIC", "top_10_models_spbic.txt")
+```
+
+
+
+
+
+
+

@@ -1,0 +1,31 @@
+Top 10 Models by SPBIC :
+Model: iso_combo1_6 
+Variables: CHAS 
+
+Model: iso_combo2_5 
+Variables: Latitude, CHAS 
+
+Model: iso_combo1_1 
+Variables: Latitude 
+
+Model: iso_combo1_4 
+Variables: ZN 
+
+Model: iso_combo2_41 
+Variables: ZN, CHAS 
+
+Model: iso_combo1_14 
+Variables: B 
+
+Model: iso_combo1_9 
+Variables: AGE 
+
+Model: iso_combo2_68 
+Variables: CHAS, B 
+
+Model: iso_combo1_11 
+Variables: RAD 
+
+Model: iso_combo2_63 
+Variables: CHAS, AGE 
+

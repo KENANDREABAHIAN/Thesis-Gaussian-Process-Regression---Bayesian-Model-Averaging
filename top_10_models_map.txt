@@ -1,0 +1,31 @@
+Top 10 Models by MAP :
+Model: iso_combo10_2937 
+Variables: CRIM, NOX, RM, AGE, DIS, RAD, TAX, PTRATIO, B, LSTAT 
+
+Model: iso_combo11_1326 
+Variables: CRIM, ZN, INDUS, NOX, RM, AGE, DIS, RAD, TAX, B, LSTAT 
+
+Model: iso_combo12_351 
+Variables: Latitude, CRIM, INDUS, NOX, RM, AGE, DIS, RAD, TAX, PTRATIO, B, LSTAT 
+
+Model: iso_combo11_1205 
+Variables: Longitude, CRIM, INDUS, NOX, RM, AGE, DIS, RAD, TAX, B, LSTAT 
+
+Model: iso_combo11_489 
+Variables: Latitude, Longitude, CRIM, NOX, RM, AGE, DIS, RAD, TAX, B, LSTAT 
+
+Model: iso_combo12_429 
+Variables: Longitude, CRIM, INDUS, NOX, RM, AGE, DIS, RAD, TAX, PTRATIO, B, LSTAT 
+
+Model: iso_combo10_2491 
+Variables: Longitude, CRIM, NOX, RM, AGE, DIS, RAD, TAX, B, LSTAT 
+
+Model: iso_combo10_1776 
+Variables: Latitude, CRIM, NOX, RM, AGE, DIS, RAD, TAX, B, LSTAT 
+
+Model: iso_combo12_159 
+Variables: Latitude, Longitude, CRIM, ZN, NOX, RM, AGE, DIS, RAD, TAX, B, LSTAT 
+
+Model: iso_combo12_220 
+Variables: Latitude, Longitude, CRIM, NOX, RM, AGE, DIS, RAD, TAX, PTRATIO, B, LSTAT 
+
