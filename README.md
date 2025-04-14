@@ -1,5 +1,5 @@
 **Abstract**
-
+<p align="justify"> 
 Spatial analysis is a powerful approach used to understand patterns,
 relationships, and variations across geographic space. While Gaussian
 Process Regression (GPR) offers flexibility in modeling complex spatial
@@ -19,3 +19,4 @@ Weighted Regression (GWR) still yielded the best performance among the
 methods compared. This study demonstrates the practical benefits of
 integrating BMA with GPR in spatial modeling and contributes to the
 expanding literature on Bayesian methods in spatial data analysis.
+</p>
